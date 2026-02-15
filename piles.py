@@ -13,9 +13,14 @@ import random
 import json
 import os
 import re
+import csv
+import hashlib
+import base58
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 import webbrowser
+from eth_keys import keys as eth_keys_lib
+from eth_utils import to_checksum_address
 
 class SiteScannerGUI:
     def __init__(self, root):
@@ -30,6 +35,24 @@ class SiteScannerGUI:
         self.is_scanning = False
         self.results = []
         self.sites = []
+        self.check_balances_var = tk.BooleanVar(value=False)
+        self.check_nft_var = tk.BooleanVar(value=False)
+        
+        # API ключи (можно настроить)
+        self.etherscan_api_key = "YourEtherscanAPIKey"  # Получить на etherscan.io
+        self.alchemy_api_key = "YourAlchemyAPIKey"  # Получить на alchemy.com
+        
+        # Популярные ERC-20 токены для проверки
+        self.erc20_tokens = {
+            'USDT': '0xdac17f958d2ee523a2206206994597c13d831ec7',
+            'USDC': '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+            'LINK': '0x514910771af9ca656af840dff83e8264ecf986ca',
+            'UNI': '0x1f9840a85d5af5bf1d1762f925bdaddc4201f984',
+            'DAI': '0x6b175474e89094c44da98b954eedeac495271d0f',
+            'WBTC': '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599',
+            'MATIC': '0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0',
+            'SHIB': '0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce'
+        }
         
         # Создаем папку для результатов
         self.create_results_folder()
@@ -86,6 +109,14 @@ class SiteScannerGUI:
         ttk.Spinbox(timeout_frame, from_=5, to=30, 
                    textvariable=self.timeout_var, width=10).pack(side=tk.RIGHT)
         
+        # Дополнительные опции
+        options_frame = ttk.Frame(settings_frame)
+        options_frame.pack(fill=tk.X, pady=5)
+        ttk.Checkbutton(options_frame, text="Проверять балансы", 
+                       variable=self.check_balances_var).pack(anchor=tk.W)
+        ttk.Checkbutton(options_frame, text="Искать NFT", 
+                       variable=self.check_nft_var).pack(anchor=tk.W)
+        
         # Список сайтов
         sites_frame = ttk.LabelFrame(left_panel, text="🌐 СПИСОК САЙТОВ", padding=5)
         sites_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -120,9 +151,17 @@ class SiteScannerGUI:
                                    command=self.stop_scan, state=tk.DISABLED, width=15)
         self.btn_stop.pack(side=tk.LEFT, padx=2)
         
-        self.btn_save = ttk.Button(button_frame, text="💾 СОХРАНИТЬ", 
-                                   command=self.save_results, width=15)
+        self.btn_save = ttk.Button(button_frame, text="💾 TXT", 
+                                   command=self.save_results, width=10)
         self.btn_save.pack(side=tk.LEFT, padx=2)
+        
+        self.btn_csv = ttk.Button(button_frame, text="📄 CSV", 
+                                  command=self.save_results_csv, width=10)
+        self.btn_csv.pack(side=tk.LEFT, padx=2)
+        
+        self.btn_json = ttk.Button(button_frame, text="📦 JSON", 
+                                   command=self.save_results_json, width=10)
+        self.btn_json.pack(side=tk.LEFT, padx=2)
         
         self.btn_clear = ttk.Button(button_frame, text="🗑️ ОЧИСТИТЬ", 
                                     command=self.clear_all, width=15)
@@ -339,11 +378,24 @@ class SiteScannerGUI:
                         html = await response.text()
                         keys = self.find_real_keys(html)
                         
+                        # Проверяем балансы и NFT если найдены ключи
+                        enriched_keys = []
+                        if keys and (self.check_balances_var.get() or self.check_nft_var.get()):
+                            enriched_keys = await self.enrich_keys_with_data(keys)
+                        
                         status = f"✅ {response.status}"
                         if keys:
                             self.log(f"🔑 {site} - НАЙДЕНО {len(keys)} КЛЮЧЕЙ!", "KEY")
-                            for key in keys[:3]:
+                            for i, key in enumerate(keys[:3]):
                                 self.log(f"   {key[:80]}...", "KEY")
+                                # Показываем баланс если есть
+                                if enriched_keys and i < len(enriched_keys):
+                                    if enriched_keys[i].get('balance'):
+                                        bal = enriched_keys[i]['balance']
+                                        self.log(f"      💰 {bal['balance']:.8f} {bal['currency']}", "SUCCESS")
+                                    if enriched_keys[i].get('nfts'):
+                                        nft = enriched_keys[i]['nfts']
+                                        self.log(f"      🖼️ NFT: {nft['nft_count']}", "SUCCESS")
                         else:
                             self.log(f"📄 {site} - {response.status} ({elapsed:.1f} сек)", "INFO")
                         
@@ -352,6 +404,7 @@ class SiteScannerGUI:
                             'status': 'ok',
                             'http_status': response.status,
                             'keys': keys,
+                            'enriched_keys': enriched_keys if enriched_keys else keys,
                             'time': elapsed,
                             'size': len(html)
                         }
@@ -687,8 +740,309 @@ class SiteScannerGUI:
                     phrase_str = ' '.join(phrase_24)
                     keys.append(f"BIP39 Mnemonic (24 words): {phrase_str}")
         
+        # 9. Bitcoin адреса (Legacy, SegWit, Bech32)
+        btc_patterns = [
+            r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b',  # Legacy P2PKH/P2SH
+            r'\bbc1[a-z0-9]{39,59}\b'  # Bech32 (SegWit)
+        ]
+        
+        for pattern in btc_patterns:
+            matches = re.findall(pattern, html)
+            for match in matches[:10]:  # Ограничиваем количество
+                keys.append(f"Bitcoin Address: {match}")
+        
+        # 10. Ethereum адреса
+        eth_pattern = r'0x[a-fA-F0-9]{40}\b'
+        eth_matches = re.findall(eth_pattern, html)
+        for match in eth_matches[:10]:  # Ограничиваем
+            keys.append(f"Ethereum Address: {match}")
+        
+        # 11. Solana адреса (Base58, 32-44 символа)
+        sol_pattern = r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b'
+        sol_matches = re.findall(sol_pattern, html)
+        # Фильтруем - исключаем BTC и простые строки
+        for match in sol_matches[:5]:
+            if len(match) >= 43 and not match.startswith(('1', '3', 'bc1')):
+                keys.append(f"Solana Address: {match}")
+        
         # Убираем дубликаты
         return list(set(keys))
+    
+    def derive_eth_address_from_private_key(self, private_key: str) -> Optional[str]:
+        """Получение Ethereum адреса из приватного ключа"""
+        try:
+            # Убираем 0x если есть
+            if private_key.startswith('0x'):
+                private_key = private_key[2:]
+            
+            # Проверяем длину (64 hex символа)
+            if len(private_key) != 64:
+                return None
+            
+            # Простой способ - используем keccak256
+            from Crypto.Hash import keccak
+            import ecdsa
+            
+            private_key_bytes = bytes.fromhex(private_key)
+            sk = ecdsa.SigningKey.from_string(private_key_bytes, curve=ecdsa.SECP256k1)
+            public_key = sk.get_verifying_key().to_string()
+            
+            # Keccak256 хэш публичного ключа
+            k = keccak.new(digest_bits=256)
+            k.update(public_key)
+            address_bytes = k.digest()[-20:]
+            
+            address = '0x' + address_bytes.hex()
+            return address.lower()
+        except:
+            return None
+    
+    async def check_eth_balance(self, address: str) -> Optional[Dict]:
+        """Проверка баланса Ethereum"""
+        try:
+            # Используем бесплатный API Etherscan
+            url = f"https://api.etherscan.io/api?module=account&action=balance&address={address}&tag=latest&apikey={self.etherscan_api_key}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('status') == '1':
+                            balance_wei = int(data.get('result', 0))
+                            balance_eth = balance_wei / 1e18
+                            return {'address': address, 'balance': balance_eth, 'currency': 'ETH'}
+        except:
+            pass
+        return None
+    
+    async def check_erc20_balances(self, address: str) -> Optional[Dict]:
+        """Проверка балансов ERC-20 токенов"""
+        token_balances = {}
+        
+        for token_name, token_address in self.erc20_tokens.items():
+            try:
+                url = f"https://api.etherscan.io/api?module=account&action=tokenbalance&contractaddress={token_address}&address={address}&tag=latest&apikey={self.etherscan_api_key}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data.get('status') == '1':
+                                balance_raw = int(data.get('result', 0))
+                                if balance_raw > 0:
+                                    # Большинство токенов имеют 18 decimals, но USDT/USDC - 6
+                                    decimals = 6 if token_name in ['USDT', 'USDC'] else 18
+                                    balance = balance_raw / (10 ** decimals)
+                                    token_balances[token_name] = balance
+                await asyncio.sleep(0.2)  # Rate limiting
+            except:
+                continue
+        
+        return token_balances if token_balances else None
+    
+    async def check_bsc_balance(self, address: str) -> Optional[Dict]:
+        """Проверка баланса Binance Smart Chain (BNB)"""
+        try:
+            # Используем бесплатный API BscScan
+            url = f"https://api.bscscan.com/api?module=account&action=balance&address={address}&tag=latest&apikey=YourApiKeyToken"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('status') == '1':
+                            balance_wei = int(data.get('result', 0))
+                            balance_bnb = balance_wei / 1e18
+                            return {'balance': balance_bnb, 'currency': 'BNB'}
+        except:
+            pass
+        return None
+    
+    async def check_polygon_balance(self, address: str) -> Optional[Dict]:
+        """Проверка баланса Polygon (MATIC)"""
+        try:
+            # Используем бесплатный API PolygonScan
+            url = f"https://api.polygonscan.com/api?module=account&action=balance&address={address}&tag=latest&apikey=YourApiKeyToken"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('status') == '1':
+                            balance_wei = int(data.get('result', 0))
+                            balance_matic = balance_wei / 1e18
+                            return {'balance': balance_matic, 'currency': 'MATIC'}
+        except:
+            pass
+        return None
+    
+    async def check_eth_transactions(self, address: str) -> Optional[Dict]:
+        """Проверка истории транзакций Ethereum"""
+        try:
+            # Проверяем количество транзакций
+            url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&page=1&offset=10&sort=desc&apikey={self.etherscan_api_key}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('status') == '1':
+                            transactions = data.get('result', [])
+                            if transactions:
+                                return {
+                                    'address': address,
+                                    'tx_count': len(transactions),
+                                    'has_activity': True,
+                                    'first_tx': transactions[-1] if transactions else None,
+                                    'last_tx': transactions[0] if transactions else None
+                                }
+                            else:
+                                return {'address': address, 'tx_count': 0, 'has_activity': False}
+        except:
+            pass
+        return None
+    
+    async def check_btc_balance(self, address: str) -> Optional[Dict]:
+        """Проверка баланса Bitcoin"""
+        try:
+            # Используем blockchain.info API
+            url = f"https://blockchain.info/q/addressbalance/{address}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        balance_satoshi = int(await response.text())
+                        balance_btc = balance_satoshi / 1e8
+                        return {'address': address, 'balance': balance_btc, 'currency': 'BTC'}
+        except:
+            pass
+        return None
+    
+    async def check_nft_ownership(self, address: str) -> Optional[Dict]:
+        """Проверка NFT на адресе"""
+        try:
+            # Используем Alchemy NFT API
+            url = f"https://eth-mainnet.g.alchemy.com/v2/{self.alchemy_api_key}/getNFTs/?owner={address}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        nfts = data.get('ownedNfts', [])
+                        if nfts:
+                            return {'address': address, 'nft_count': len(nfts), 'nfts': nfts[:5]}
+        except:
+            pass
+        return None
+    
+    async def enrich_keys_with_data(self, keys: List[str]) -> List[Dict]:
+        """Обогащение найденных ключей данными о балансах, транзакциях и NFT"""
+        enriched = []
+        
+        for key in keys:
+            key_data = {'key': key, 'balance': None, 'nfts': None, 'transactions': None, 'derived_address': None}
+            
+            # 1. Обработка EVM Private Key
+            if 'EVM Private Key:' in key:
+                private_key = key.split('EVM Private Key: ')[1].strip()
+                
+                # Получаем адрес из приватного ключа
+                address = self.derive_eth_address_from_private_key(private_key)
+                
+                if address:
+                    key_data['derived_address'] = address
+                    self.log(f"   🔑 Адрес: {address}", "INFO")
+                    
+                    # Проверяем транзакции
+                    tx_info = await self.check_eth_transactions(address)
+                    if tx_info:
+                        key_data['transactions'] = tx_info
+                        if tx_info['has_activity']:
+                            self.log(f"   ✅ АКТИВНЫЙ КОШЕЛЕК! Транзакций: {tx_info['tx_count']}", "SUCCESS")
+                        else:
+                            self.log(f"   ⚪ Кошелек не использовался (0 транзакций)", "WARNING")
+                    
+                    # Проверяем баланс
+                    if self.check_balances_var.get():
+                        balance_info = await self.check_eth_balance(address)
+                        if balance_info and balance_info['balance'] > 0:
+                            key_data['balance'] = balance_info
+                            self.log(f"   💰 ETH баланс: {balance_info['balance']:.6f} ETH", "SUCCESS")
+                        
+                        # Проверяем ERC-20 токены
+                        erc20_balances = await self.check_erc20_balances(address)
+                        if erc20_balances:
+                            key_data['erc20_tokens'] = erc20_balances
+                            for token, balance in erc20_balances.items():
+                                self.log(f"   🟢 {token}: {balance:.4f}", "SUCCESS")
+                        
+                        # Проверяем BNB (Binance Smart Chain)
+                        bnb_balance = await self.check_bsc_balance(address)
+                        if bnb_balance and bnb_balance['balance'] > 0:
+                            key_data['bnb_balance'] = bnb_balance
+                            self.log(f"   🟡 BNB: {bnb_balance['balance']:.6f}", "SUCCESS")
+                        
+                        # Проверяем MATIC (Polygon)
+                        matic_balance = await self.check_polygon_balance(address)
+                        if matic_balance and matic_balance['balance'] > 0:
+                            key_data['matic_balance'] = matic_balance
+                            self.log(f"   🟪 MATIC: {matic_balance['balance']:.6f}", "SUCCESS")
+                    
+                    # Проверяем NFT
+                    if self.check_nft_var.get():
+                        nft_info = await self.check_nft_ownership(address)
+                        if nft_info:
+                            key_data['nfts'] = nft_info
+                            self.log(f"   🖼️ NFT: {nft_info['nft_count']} шт.", "SUCCESS")
+            
+            # 2. Обработка Ethereum Address
+            elif 'Ethereum Address:' in key:
+                address = key.split('Ethereum Address: ')[1].strip()
+                
+                # Проверяем транзакции
+                tx_info = await self.check_eth_transactions(address)
+                if tx_info:
+                    key_data['transactions'] = tx_info
+                    if tx_info['has_activity']:
+                        self.log(f"   ✅ Активный адрес! Транзакций: {tx_info['tx_count']}", "SUCCESS")
+                
+                if self.check_balances_var.get():
+                    balance_info = await self.check_eth_balance(address)
+                    if balance_info and balance_info['balance'] > 0:
+                        key_data['balance'] = balance_info
+                        self.log(f"   💰 ETH баланс: {balance_info['balance']:.6f} ETH", "SUCCESS")
+                    
+                    # Проверяем ERC-20 токены
+                    erc20_balances = await self.check_erc20_balances(address)
+                    if erc20_balances:
+                        key_data['erc20_tokens'] = erc20_balances
+                        for token, balance in erc20_balances.items():
+                            self.log(f"   🟢 {token}: {balance:.4f}", "SUCCESS")
+                    
+                    # Проверяем другие сети
+                    bnb_balance = await self.check_bsc_balance(address)
+                    if bnb_balance and bnb_balance['balance'] > 0:
+                        key_data['bnb_balance'] = bnb_balance
+                        self.log(f"   🟡 BNB: {bnb_balance['balance']:.6f}", "SUCCESS")
+                    
+                    matic_balance = await self.check_polygon_balance(address)
+                    if matic_balance and matic_balance['balance'] > 0:
+                        key_data['matic_balance'] = matic_balance
+                        self.log(f"   🟪 MATIC: {matic_balance['balance']:.6f}", "SUCCESS")
+                
+                if self.check_nft_var.get():
+                    nft_info = await self.check_nft_ownership(address)
+                    if nft_info:
+                        key_data['nfts'] = nft_info
+                        self.log(f"   🖼️ NFT: {nft_info['nft_count']} шт.", "SUCCESS")
+            
+            # 3. Обработка Bitcoin Address
+            elif 'Bitcoin Address:' in key:
+                address = key.split('Bitcoin Address: ')[1].strip()
+                
+                if self.check_balances_var.get():
+                    balance_info = await self.check_btc_balance(address)
+                    if balance_info:
+                        key_data['balance'] = balance_info
+                        if balance_info['balance'] > 0:
+                            self.log(f"   💰 BTC баланс: {balance_info['balance']:.8f} BTC", "SUCCESS")
+            
+            enriched.append(key_data)
+        
+        return enriched
     
     def analyze_results(self):
         """Анализ результатов сканирования"""
@@ -779,6 +1133,105 @@ class SiteScannerGUI:
             
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}")
+    
+    def save_results_csv(self):
+        """Сохранение результатов в CSV"""
+        if not self.results:
+            messagebox.showinfo("Инфо", "Нет результатов для сохранения")
+            return
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_file = os.path.join(self.results_folder, f'keys_export_{timestamp}.csv')
+        
+        try:
+            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Site', 'Key Type', 'Key Value', 'Balance', 'Currency', 'NFT Count'])
+                
+                for result in self.results:
+                    if result.get('keys'):
+                        site = result['site']
+                        enriched = result.get('enriched_keys', result['keys'])
+                        
+                        for i, key in enumerate(result['keys']):
+                            # Разделяем тип и значение
+                            if ':' in key:
+                                key_type, key_value = key.split(':', 1)
+                                key_type = key_type.strip()
+                                key_value = key_value.strip()
+                            else:
+                                key_type = 'Unknown'
+                                key_value = key
+                            
+                            balance = ''
+                            currency = ''
+                            nft_count = ''
+                            
+                            # Добавляем данные о балансах/NFT если есть
+                            if isinstance(enriched, list) and i < len(enriched):
+                                if isinstance(enriched[i], dict):
+                                    if enriched[i].get('balance'):
+                                        balance = enriched[i]['balance']['balance']
+                                        currency = enriched[i]['balance']['currency']
+                                    if enriched[i].get('nfts'):
+                                        nft_count = enriched[i]['nfts']['nft_count']
+                            
+                            writer.writerow([site, key_type, key_value, balance, currency, nft_count])
+            
+            self.log(f"📄 Экспорт CSV: {csv_file}", "SUCCESS")
+            messagebox.showinfo("Успех", f"CSV сохранён:\n{csv_file}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить CSV: {e}")
+    
+    def save_results_json(self):
+        """Сохранение результатов в JSON"""
+        if not self.results:
+            messagebox.showinfo("Инфо", "Нет результатов для сохранения")
+            return
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        json_file = os.path.join(self.results_folder, f'keys_export_{timestamp}.json')
+        
+        try:
+            # Формируем структурированные данные
+            export_data = {
+                'scan_date': datetime.now().isoformat(),
+                'total_sites': len(self.sites),
+                'successful_scans': len([r for r in self.results if r.get('status') == 'ok']),
+                'total_keys_found': sum(len(r.get('keys', [])) for r in self.results),
+                'results': []
+            }
+            
+            for result in self.results:
+                if result.get('keys'):
+                    result_data = {
+                        'site': result['site'],
+                        'status': result['status'],
+                        'http_status': result.get('http_status'),
+                        'scan_time': result.get('time'),
+                        'keys': []
+                    }
+                    
+                    enriched = result.get('enriched_keys', result['keys'])
+                    
+                    for i, key in enumerate(result['keys']):
+                        key_info = {'raw_key': key}
+                        
+                        if isinstance(enriched, list) and i < len(enriched) and isinstance(enriched[i], dict):
+                            key_info['balance'] = enriched[i].get('balance')
+                            key_info['nfts'] = enriched[i].get('nfts')
+                        
+                        result_data['keys'].append(key_info)
+                    
+                    export_data['results'].append(result_data)
+            
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
+            
+            self.log(f"📦 Экспорт JSON: {json_file}", "SUCCESS")
+            messagebox.showinfo("Успех", f"JSON сохранён:\n{json_file}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить JSON: {e}")
     
     def auto_save_results(self):
         """Автосохранение результатов"""
